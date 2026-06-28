@@ -1,160 +1,237 @@
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
+const { Pool } = require("pg");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ── In-memory storage ──
-const devices = {};
-const locationReports = {};
-const notifications = [];
-const pendingCommands = {};  // NEW: tracks pending recovery commands
+// ── PostgreSQL connection ──
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+// ── Create tables on startup ──
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS devices (
+      phone_number TEXT PRIMARY KEY,
+      emergency_contact TEXT NOT NULL,
+      credential_hash TEXT NOT NULL,
+      fcm_token TEXT DEFAULT '',
+      registered_at TIMESTAMPTZ DEFAULT NOW(),
+      fail_count INTEGER DEFAULT 0,
+      locked_until TIMESTAMPTZ NULL
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS location_reports (
+      id SERIAL PRIMARY KEY,
+      phone_number TEXT NOT NULL,
+      latitude DOUBLE PRECISION NOT NULL,
+      longitude DOUBLE PRECISION NOT NULL,
+      accuracy DOUBLE PRECISION,
+      timestamp TEXT,
+      received_at TIMESTAMPTZ DEFAULT NOW(),
+      source TEXT DEFAULT 'direct'
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS pending_commands (
+      phone_number TEXT PRIMARY KEY,
+      has_command BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+
+  console.log("✅ Database tables ready");
+}
+
+initDB().catch(console.error);
 
 // ─────────────────────────────────────────────────────────
 // POST /register
 // ─────────────────────────────────────────────────────────
-app.post("/register", (req, res) => {
+app.post("/register", async (req, res) => {
   const { phoneNumber, emergencyContact, credentialHash, fcmToken } = req.body;
 
   if (!phoneNumber || !emergencyContact || !credentialHash) {
     return res.status(400).json({ error: "Missing required fields" });
   }
 
-  devices[phoneNumber] = {
-    phoneNumber,
-    emergencyContact,
-    credentialHash,
-    fcmToken: fcmToken || "",
-    registeredAt: new Date().toISOString(),
-    failCount: 0,
-    lockedUntil: null,
-  };
+  try {
+    await pool.query(`
+      INSERT INTO devices (phone_number, emergency_contact, credential_hash, fcm_token)
+      VALUES ($1, $2, $3, $4)
+      ON CONFLICT (phone_number) DO UPDATE
+        SET emergency_contact = $2,
+            credential_hash   = $3,
+            fcm_token         = $4,
+            registered_at     = NOW()
+    `, [phoneNumber, emergencyContact, credentialHash, fcmToken || ""]);
 
-  console.log(`✅ Device registered: ${phoneNumber}`);
-  return res.status(200).json({ success: true, message: "Device registered" });
+    console.log(`✅ Device registered: ${phoneNumber}`);
+    return res.status(200).json({ success: true, message: "Device registered" });
+  } catch (err) {
+    console.error("Register error:", err);
+    return res.status(500).json({ error: "Registration failed" });
+  }
 });
 
 // ─────────────────────────────────────────────────────────
 // POST /recover
 // ─────────────────────────────────────────────────────────
-app.post("/recover", (req, res) => {
+app.post("/recover", async (req, res) => {
   const { phoneNumber, credential } = req.body;
 
   if (!phoneNumber || !credential) {
     return res.status(400).json({ error: "Phone number and credential required" });
   }
 
-  const device = devices[phoneNumber];
-  if (!device) {
-    return res.status(404).json({ error: "Device not registered" });
-  }
+  try {
+    const result = await pool.query(
+      "SELECT * FROM devices WHERE phone_number = $1", [phoneNumber]
+    );
 
-  // Lockout check
-  if (device.lockedUntil && new Date(device.lockedUntil) > new Date()) {
-    const remaining = Math.ceil((new Date(device.lockedUntil) - new Date()) / 60000);
-    return res.status(429).json({
-      error: `Account locked. Try again in ${remaining} minute(s).`,
-    });
-  }
-
-  // Validate credential
-  const submittedHash = crypto
-    .createHash("sha256")
-    .update(credential + phoneNumber)
-    .digest("hex");
-
-  if (submittedHash !== device.credentialHash) {
-    device.failCount = (device.failCount || 0) + 1;
-    console.log(`❌ Wrong credential for ${phoneNumber} (attempt ${device.failCount})`);
-
-    if (device.failCount >= 3) {
-      device.lockedUntil = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
-      device.failCount = 0;
-      console.log(`🔒 Account locked: ${phoneNumber}`);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Device not registered" });
     }
 
-    return res.status(401).json({ error: "Invalid credential" });
+    const device = result.rows[0];
+
+    // Lockout check
+    if (device.locked_until && new Date(device.locked_until) > new Date()) {
+      const remaining = Math.ceil((new Date(device.locked_until) - new Date()) / 60000);
+      return res.status(429).json({
+        error: `Account locked. Try again in ${remaining} minute(s).`,
+      });
+    }
+
+    // Validate credential
+    const submittedHash = crypto
+      .createHash("sha256")
+      .update(credential + phoneNumber)
+      .digest("hex");
+
+    if (submittedHash !== device.credential_hash) {
+      const newFailCount = (device.fail_count || 0) + 1;
+      let lockedUntil = null;
+
+      if (newFailCount >= 3) {
+        lockedUntil = new Date(Date.now() + 24 * 60 * 60 * 1000);
+        console.log(`🔒 Account locked: ${phoneNumber}`);
+      }
+
+      await pool.query(
+        "UPDATE devices SET fail_count = $1, locked_until = $2 WHERE phone_number = $3",
+        [newFailCount >= 3 ? 0 : newFailCount, lockedUntil, phoneNumber]
+      );
+
+      console.log(`❌ Wrong credential for ${phoneNumber} (attempt ${newFailCount})`);
+      return res.status(401).json({ error: "Invalid credential" });
+    }
+
+    // Valid — reset fail count
+    await pool.query(
+      "UPDATE devices SET fail_count = 0, locked_until = NULL WHERE phone_number = $1",
+      [phoneNumber]
+    );
+
+    // Clear previous location reports
+    await pool.query(
+      "DELETE FROM location_reports WHERE phone_number = $1", [phoneNumber]
+    );
+
+    // Set pending command
+    await pool.query(`
+      INSERT INTO pending_commands (phone_number, has_command)
+      VALUES ($1, TRUE)
+      ON CONFLICT (phone_number) DO UPDATE SET has_command = TRUE, created_at = NOW()
+    `, [phoneNumber]);
+
+    console.log(`🚨 RECOVERY TRIGGERED for ${phoneNumber}`);
+    return res.status(200).json({
+      success: true,
+      message: "Recovery command dispatched.",
+    });
+  } catch (err) {
+    console.error("Recovery error:", err);
+    return res.status(500).json({ error: "Recovery failed" });
   }
-
-  // Valid
-  device.failCount = 0;
-  device.lockedUntil = null;
-
-  console.log(`🚨 RECOVERY TRIGGERED for ${phoneNumber}`);
-  console.log(`📡 Sending recovery command to device...`);
-
-  // Clear previous location and set pending command
-  locationReports[phoneNumber] = null;
-  pendingCommands[phoneNumber] = true;  // NEW
-
-  return res.status(200).json({
-    success: true,
-    message: "Recovery command dispatched.",
-  });
 });
 
 // ─────────────────────────────────────────────────────────
-// GET /checkCommand  (NEW — polled by Android app)
+// GET /checkCommand
 // ─────────────────────────────────────────────────────────
-app.get("/checkCommand", (req, res) => {
+app.get("/checkCommand", async (req, res) => {
   const { phoneNumber } = req.query;
   if (!phoneNumber) return res.status(400).json({ error: "Phone number required" });
 
-  const hasCommand = pendingCommands[phoneNumber] === true;
-  if (hasCommand) {
-    pendingCommands[phoneNumber] = false;
-    console.log(`📲 Recovery command delivered to: ${phoneNumber}`);
+  try {
+    const result = await pool.query(
+      "SELECT has_command FROM pending_commands WHERE phone_number = $1", [phoneNumber]
+    );
+
+    const hasCommand = result.rows.length > 0 && result.rows[0].has_command;
+
+    if (hasCommand) {
+      await pool.query(
+        "UPDATE pending_commands SET has_command = FALSE WHERE phone_number = $1",
+        [phoneNumber]
+      );
+      console.log(`📲 Recovery command delivered to: ${phoneNumber}`);
+    }
+
+    return res.status(200).json({ hasCommand });
+  } catch (err) {
+    console.error("CheckCommand error:", err);
+    return res.status(500).json({ error: "Command check failed" });
   }
-  return res.status(200).json({ hasCommand });
 });
 
 // ─────────────────────────────────────────────────────────
 // POST /locationReport
 // ─────────────────────────────────────────────────────────
-app.post("/locationReport", (req, res) => {
+app.post("/locationReport", async (req, res) => {
   const { phoneNumber, latitude, longitude, accuracy, timestamp } = req.body;
 
   if (!phoneNumber || !latitude || !longitude) {
     return res.status(400).json({ error: "Missing location data" });
   }
 
-  const device = devices[phoneNumber];
-  if (!device) {
-    return res.status(404).json({ error: "Device not found" });
+  try {
+    const deviceResult = await pool.query(
+      "SELECT * FROM devices WHERE phone_number = $1", [phoneNumber]
+    );
+
+    if (deviceResult.rows.length === 0) {
+      return res.status(404).json({ error: "Device not found" });
+    }
+
+    await pool.query(`
+      INSERT INTO location_reports (phone_number, latitude, longitude, accuracy, timestamp)
+      VALUES ($1, $2, $3, $4, $5)
+    `, [phoneNumber, latitude, longitude, accuracy, timestamp]);
+
+    const mapsLink = `https://maps.google.com/?q=${latitude},${longitude}`;
+    console.log(`📍 Location received for ${phoneNumber}: ${latitude}, ${longitude}`);
+    console.log(`🗺️  Map link: ${mapsLink}`);
+
+    return res.status(200).json({ success: true });
+  } catch (err) {
+    console.error("Location report error:", err);
+    return res.status(500).json({ error: "Failed to process location" });
   }
-
-  locationReports[phoneNumber] = {
-    latitude,
-    longitude,
-    accuracy,
-    timestamp,
-    receivedAt: new Date().toISOString(),
-  };
-
-  const mapsLink = `https://maps.google.com/?q=${latitude},${longitude}`;
-
-  const notification = {
-    to: device.emergencyContact,
-    message: `CORVON ALERT: Device located! View location: ${mapsLink}`,
-    sentAt: new Date().toISOString(),
-  };
-  notifications.push(notification);
-
-  console.log(`📍 Location received for ${phoneNumber}: ${latitude}, ${longitude}`);
-  console.log(`📱 SMS to ${device.emergencyContact}: ${notification.message}`);
-  console.log(`🗺️  Map link: ${mapsLink}`);
-
-  return res.status(200).json({ success: true });
 });
 
 // ─────────────────────────────────────────────────────────
-// GET /relayLocation  (SMS FALLBACK — called when emergency
-// contact taps the link inside the fallback SMS, since the
-// lost phone had no internet to report directly)
+// GET /relayLocation
 // ─────────────────────────────────────────────────────────
-app.get("/relayLocation", (req, res) => {
+app.get("/relayLocation", async (req, res) => {
   const { phone, lat, lng } = req.query;
 
   if (!phone || !lat || !lng) {
@@ -166,57 +243,83 @@ app.get("/relayLocation", (req, res) => {
     `);
   }
 
+  try {
+    await pool.query(`
+      INSERT INTO location_reports (phone_number, latitude, longitude, accuracy, timestamp, source)
+      VALUES ($1, $2, $3, NULL, $4, 'sms-fallback-relay')
+    `, [phone, parseFloat(lat), parseFloat(lng), new Date().toISOString()]);
 
-  locationReports[phone] = {
-    latitude: parseFloat(lat),
-    longitude: parseFloat(lng),
-    accuracy: null,
-    timestamp: new Date().toISOString(),
-    receivedAt: new Date().toISOString(),
-    source: "sms-fallback-relay",
-  };
+    console.log(`📨 Location relayed via SMS fallback for ${phone}: ${lat}, ${lng}`);
 
-  console.log(`📨 Location relayed via SMS fallback for ${phone}: ${lat}, ${lng}`);
-
-  return res.send(`
-    <html>
-    <body style="font-family:sans-serif;text-align:center;padding:40px;background:#0a1628;color:white;">
-      <h2>✅ Location shared with owner</h2>
-      <p>The device owner can now see this location on their recovery portal.</p>
-      <p style="color:#8899aa;">Lat: ${lat}, Lng: ${lng}</p>
-      <p style="margin-top:30px;color:#e8a020;font-size:14px;">You can close this page now.</p>
-    </body>
-    </html>
-  `);
+    return res.send(`
+      <html>
+      <body style="font-family:sans-serif;text-align:center;padding:40px;background:#0a1628;color:white;">
+        <h2>✅ Location shared with owner</h2>
+        <p>The device owner can now see this location on their recovery portal.</p>
+        <p style="color:#8899aa;">Lat: ${lat}, Lng: ${lng}</p>
+        <p style="margin-top:30px;color:#e8a020;font-size:14px;">You can close this page now.</p>
+      </body>
+      </html>
+    `);
+  } catch (err) {
+    console.error("Relay error:", err);
+    return res.status(500).send(`
+      <html><body style="font-family:sans-serif;text-align:center;padding:40px;">
+        <h2>❌ Error storing location</h2>
+      </body></html>
+    `);
+  }
 });
 
 // ─────────────────────────────────────────────────────────
 // GET /status
 // ─────────────────────────────────────────────────────────
-app.get("/status", (req, res) => {
+app.get("/status", async (req, res) => {
+  res.set("Access-Control-Allow-Origin", "*");
   const { phoneNumber } = req.query;
 
   if (!phoneNumber) {
     return res.status(400).json({ error: "Phone number required" });
   }
 
-  const location = locationReports[phoneNumber];
+  try {
+    const result = await pool.query(`
+      SELECT * FROM location_reports
+      WHERE phone_number = $1
+      ORDER BY received_at DESC
+      LIMIT 1
+    `, [phoneNumber]);
 
-  if (!location) {
-    return res.status(200).json({ status: "PENDING", location: null });
+    if (result.rows.length === 0) {
+      return res.status(200).json({ status: "PENDING", location: null });
+    }
+
+    const latest = result.rows[0];
+    return res.status(200).json({
+      status: "LOCATION_RECEIVED",
+      location: {
+        latitude: latest.latitude,
+        longitude: latest.longitude,
+        accuracy: latest.accuracy,
+        timestamp: latest.timestamp,
+      },
+    });
+  } catch (err) {
+    console.error("Status error:", err);
+    return res.status(500).json({ error: "Status check failed" });
   }
-
-  return res.status(200).json({
-    status: "LOCATION_RECEIVED",
-    location,
-  });
 });
 
 // ─────────────────────────────────────────────────────────
 // GET /devices
 // ─────────────────────────────────────────────────────────
-app.get("/devices", (req, res) => {
-  return res.status(200).json({ devices: Object.keys(devices) });
+app.get("/devices", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT phone_number FROM devices");
+    return res.status(200).json({ devices: result.rows.map(r => r.phone_number) });
+  } catch (err) {
+    return res.status(500).json({ error: "Failed to fetch devices" });
+  }
 });
 
 // ─────────────────────────────────────────────────────────
@@ -225,15 +328,15 @@ app.get("/devices", (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log("===========================================");
-  console.log("  CORVON Backend Server — LOCAL MODE");
+  console.log("  CORVON Backend Server — PostgreSQL MODE");
   console.log("===========================================");
   console.log(`✅ Server running at http://localhost:${PORT}`);
-  console.log(`✅ Also accessible on your local network`);
   console.log(`\n📋 Available endpoints:`);
-  console.log(`   POST http://localhost:${PORT}/register`);
-  console.log(`   POST http://localhost:${PORT}/recover`);
-  console.log(`   GET  http://localhost:${PORT}/checkCommand?phoneNumber=xxx`);
-  console.log(`   POST http://localhost:${PORT}/locationReport`);
-  console.log(`   GET  http://localhost:${PORT}/status?phoneNumber=xxx`);
+  console.log(`   POST /register`);
+  console.log(`   POST /recover`);
+  console.log(`   GET  /checkCommand?phoneNumber=xxx`);
+  console.log(`   POST /locationReport`);
+  console.log(`   GET  /relayLocation?phone=xxx&lat=xxx&lng=xxx`);
+  console.log(`   GET  /status?phoneNumber=xxx`);
   console.log(`\n⏳ Waiting for connections...`);
 });
