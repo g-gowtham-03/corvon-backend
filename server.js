@@ -184,6 +184,7 @@ app.get("/relayLocation", (req, res) => {
       <h2>✅ Location shared with owner</h2>
       <p>The device owner can now see this location on their recovery portal.</p>
       <p style="color:#8899aa;">Lat: ${lat}, Lng: ${lng}</p>
+      <p style="margin-top:30px;color:#e8a020;font-size:14px;">You can close this page now.</p>
     </body>
     </html>
   `);
