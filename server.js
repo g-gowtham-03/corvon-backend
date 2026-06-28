@@ -166,14 +166,6 @@ app.get("/relayLocation", (req, res) => {
     `);
   }
 
-  const device = devices[phone];
-  if (!device) {
-    return res.status(404).send(`
-      <html><body style="font-family:sans-serif;text-align:center;padding:40px;">
-        <h2>❌ Device not found</h2>
-      </body></html>
-    `);
-  }
 
   locationReports[phone] = {
     latitude: parseFloat(lat),
