@@ -22,7 +22,30 @@ export function fcmConfigurationStatus() {
   return {configured:Boolean(instance),status:instance?'configured':initState==='invalid'?'invalid_credentials':'not_configured'};
 }
 
-export async function sendRecoveryRequest(tokens,recoveryRequestId) {
+export async function sendRecoveryRequest(tokens,recoveryRequestId,expiresAt) {
+  const instance=getFcmApp();
+  if(!instance)return {status:initState==='invalid'?'invalid_credentials':'not_configured',accepted:0,failed:0};
+  if(!tokens.length)return {status:'no_registered_device',accepted:0,failed:0};
+  const expiryMillis = Date.parse(expiresAt);
+  if (!Number.isFinite(expiryMillis) || expiryMillis <= Date.now()) return {status:'expired',accepted:0,failed:0};
+  const remainingMs = expiryMillis - Date.now();
+  let accepted=0,failed=0;
+  const messaging=getMessaging(instance);
+  for(let i=0;i<tokens.length;i+=500){
+    const batch=tokens.slice(i,i+500);
+    try {
+      const result=await messaging.sendEachForMulticast({
+        tokens:batch,
+        data:{type:'recovery_request',recoveryRequestId,expiresAt},
+        android:{priority:'high',ttl:Math.min(remainingMs,30*60*1000)}
+      });
+      accepted+=result.successCount;failed+=result.failureCount;
+    } catch { failed+=batch.length; }
+  }
+  return {status:accepted?'submitted':failed?'failed':'no_registered_device',accepted,failed};
+}
+
+export async function sendRecoveryRequestStopped(tokens,recoveryRequestId) {
   const instance=getFcmApp();
   if(!instance)return {status:initState==='invalid'?'invalid_credentials':'not_configured',accepted:0,failed:0};
   if(!tokens.length)return {status:'no_registered_device',accepted:0,failed:0};
@@ -33,8 +56,8 @@ export async function sendRecoveryRequest(tokens,recoveryRequestId) {
     try {
       const result=await messaging.sendEachForMulticast({
         tokens:batch,
-        data:{type:'recovery_request',recoveryRequestId},
-        android:{priority:'high',ttl:30*60*1000}
+        data:{type:'recovery_request_stopped',recoveryRequestId},
+        android:{priority:'high',ttl:60*60*1000}
       });
       accepted+=result.successCount;failed+=result.failureCount;
     } catch { failed+=batch.length; }

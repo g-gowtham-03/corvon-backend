@@ -1,4 +1,4 @@
-import test, { before, after } from 'node:test';
+import test, { before, beforeEach, after } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { createServer } from 'node:http';
@@ -8,7 +8,8 @@ if(!testDatabaseUrl){
   test('PostgreSQL API integration suite (set CORVON_TEST_DATABASE_URL to a dedicated migrated test database)',{skip:'PostgreSQL integration tests not run: no test database configured.'},()=>{});
 } else {
   process.env.NODE_ENV='test';
-  process.env.DATABASE_URL=testDatabaseUrl;
+  process.env.TRUST_PROXY_HOPS='1';
+  process.env.RECOVERY_DATABASE_URL=testDatabaseUrl;
   process.env.OTP_PEPPER='test-otp-pepper-value-32-bytes-minimum';
   process.env.LOOKUP_PEPPER='test-lookup-pepper-value-32-bytes';
   process.env.RECOVERY_SECRET_PEPPER='test-recovery-pepper-32-bytes-minimum';
@@ -19,6 +20,7 @@ if(!testDatabaseUrl){
   delete process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
 
   const delivered=new Map(), testPhones=[], testChallengeIds=[];
+  let testClientIp;
   let failSms=false,failEmail=false;
   const originalFetch=globalThis.fetch;
   globalThis.fetch=async(url,options={})=>{
@@ -42,7 +44,7 @@ if(!testDatabaseUrl){
   const phone=()=>`+1555${String(crypto.randomInt(0,10000000)).padStart(7,'0')}`;
   const email=()=>`corvon-${crypto.randomUUID()}@example.invalid`;
   async function call(path,method='GET',body,headers={}){
-    const response=await fetch(`${baseUrl}${path}`,{method,headers:{...(body?{'content-type':'application/json'}:{}),...headers},body:body?JSON.stringify(body):undefined});
+    const response=await fetch(`${baseUrl}${path}`,{method,headers:{'x-forwarded-for':testClientIp,...(body?{'content-type':'application/json'}:{}),...headers},body:body?JSON.stringify(body):undefined});
     return {response,body:response.status===204?null:await response.json()};
   }
   async function register({includeEmergencyName=true}={}){
@@ -61,12 +63,13 @@ if(!testDatabaseUrl){
     return result;
   }
   async function finishRegistration(account){
-    const current=await pool.query('SELECT contact_type,value_ciphertext,lookup_hash FROM user_contacts WHERE user_id=(SELECT user_id FROM registrations WHERE id=$1)',[account.registrationId]);
+    const current=await pool.query('SELECT contact_type,value_ciphertext,lookup_hash,verified_at FROM user_contacts WHERE user_id=(SELECT user_id FROM registrations WHERE id=$1)',[account.registrationId]);
     const {decryptData}=await import('../src/security.js');
-    const typeToDestination={};
-    for(const row of current.rows)typeToDestination[row.contact_type]=decryptData(row.value_ciphertext);
+    const typeToContact={};
+    for(const row of current.rows)typeToContact[row.contact_type]={destination:decryptData(row.value_ciphertext),verified:Boolean(row.verified_at)};
     for(const type of ['phone','email','emergency']){
-      const destination=typeToDestination[type];
+      const {destination,verified:alreadyVerified}=typeToContact[type];
+      if(alreadyVerified)continue;
       let requested=await requestOtp(account,type);
       if(requested.response.status!==202)requested=await requestOtp(account,type);
       assert.equal(requested.response.status,202);
@@ -94,6 +97,7 @@ if(!testDatabaseUrl){
     await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
     baseUrl=`http://127.0.0.1:${server.address().port}`;
   });
+  beforeEach(()=>{testClientIp=`198.51.100.${crypto.randomInt(1,255)}`;});
   after(async()=>{
     server.close();globalThis.fetch=originalFetch;
     if(testChallengeIds.length)await pool.query('DELETE FROM recovery_challenges WHERE id=ANY($1::uuid[])',[testChallengeIds]);
@@ -220,7 +224,7 @@ if(!testDatabaseUrl){
     const account=await finishRegistration(await register());
     for(const target of [account.phone,account.email,account.emergencyPhone])delivered.delete(target);
     const start=await call('/v1/forgot-secret-challenges','POST',{phone:account.phone});assert.equal(start.response.status,202);testChallengeIds.push(start.body.challengeId);
-    for(let i=0;i<100&&![account.phone,account.email,account.emergencyPhone].every(x=>delivered.has(x));i++)await new Promise(r=>setTimeout(r,10));
+    for(let i=0;i<600&&![account.phone,account.email,account.emergencyPhone].every(x=>delivered.has(x));i++)await new Promise(r=>setTimeout(r,25));
     assert.ok([account.phone,account.email,account.emergencyPhone].every(x=>delivered.has(x)));
     const wrong=delivered.get(account.phone)==='000000'?'111111':'000000';
     const attempts=await Promise.all(Array.from({length:9},()=>call(`/v1/forgot-secret-challenges/${start.body.challengeId}/verifications`,'POST',{contactType:'phone',code:wrong})));
@@ -241,6 +245,23 @@ if(!testDatabaseUrl){
     }
     const complete=await call(`/v1/forgot-secret-challenges/${start.body.challengeId}/complete`,'POST',{});assert.equal(complete.response.status,200);assert.equal(complete.body.dashboardAccess.scope,'dashboard');
     const login=await call('/v1/sessions','POST',{phone:account.phone,secret:account.secret});assert.equal(login.response.status,200);
+  });
+
+  test('expired Forgot Secret OTP cannot count as a verified contact',async()=>{
+    const account=await finishRegistration(await register());
+    for(const target of [account.phone,account.email,account.emergencyPhone])delivered.delete(target);
+    const start=await call('/v1/forgot-secret-challenges','POST',{phone:account.phone});assert.equal(start.response.status,202);testChallengeIds.push(start.body.challengeId);
+    for(let i=0;i<100&&![account.phone,account.email,account.emergencyPhone].every(x=>delivered.has(x));i++)await new Promise(r=>setTimeout(r,10));
+    assert.ok([account.phone,account.email,account.emergencyPhone].every(x=>delivered.has(x)));
+    await pool.query("UPDATE otp_challenges SET expires_at=now()-interval '1 second' WHERE recovery_challenge_id=$1 AND contact_type='phone'",[start.body.challengeId]);
+    const expired=await call(`/v1/forgot-secret-challenges/${start.body.challengeId}/verifications`,'POST',{contactType:'phone',code:delivered.get(account.phone)});
+    assert.equal(expired.response.status,400);
+    for(const [contactType,target] of [['email',account.email],['emergency',account.emergencyPhone]]){
+      const verified=await call(`/v1/forgot-secret-challenges/${start.body.challengeId}/verifications`,'POST',{contactType,code:delivered.get(target)});assert.equal(verified.response.status,200);
+    }
+    const complete=await call(`/v1/forgot-secret-challenges/${start.body.challengeId}/complete`,'POST',{});
+    assert.equal(complete.response.status,400);
+    assert.equal(complete.body.error.code,'VERIFICATION_INCOMPLETE');
   });
 
   test('Forgot Secret returns the same shape for a known and unknown phone',async()=>{

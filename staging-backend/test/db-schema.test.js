@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 
 process.env.NODE_ENV = 'test';
-process.env.DATABASE_URL = 'postgres://test:test@localhost/test';
+process.env.RECOVERY_DATABASE_URL = 'postgres://recovery-test:recovery-test@localhost/test';
 process.env.OTP_PEPPER = 'o'.repeat(40);
 process.env.LOOKUP_PEPPER = 'l'.repeat(40);
 process.env.RECOVERY_SECRET_PEPPER = 'r'.repeat(40);
@@ -36,14 +36,24 @@ test('DB_SCHEMA accepts only safe lowercase PostgreSQL identifiers', () => {
   }
 });
 
+test('recovery configuration requires RECOVERY_DATABASE_URL and does not accept legacy DATABASE_URL as a fallback', () => {
+  const env = envWith({ RECOVERY_DATABASE_URL: undefined, DATABASE_URL: 'postgres://legacy:test@localhost/legacy' });
+  assert.throws(() => parseConfig(env), /Invalid environment configuration/);
+  const shared = 'postgres://same-role:test@localhost/database';
+  assert.throws(() => parseConfig(envWith({ DATABASE_URL: shared, RECOVERY_DATABASE_URL: shared })), /separate restricted database role/);
+  assert.throws(() => parseConfig(envWith({ DATABASE_URL: 'postgres://same-role:legacy@legacy-host/database', RECOVERY_DATABASE_URL: 'postgres://same-role:recovery@recovery-host/database' })), /separate restricted database role/);
+});
+
 test('every pool connection receives a single-schema search_path without public fallback', () => {
   const options = poolOptionsFor({
-    DATABASE_URL: 'postgres://test:test@localhost/test',
+    RECOVERY_DATABASE_URL: 'postgres://recovery-test:recovery-test@localhost/test',
     DATABASE_SSL: 'false',
     DB_SCHEMA: 'corvon_recovery'
   });
   assert.equal(options.options, '-c search_path=corvon_recovery');
   assert.doesNotMatch(options.options, /public|,/i);
+  assert.equal(options.connectionString, 'postgres://recovery-test:recovery-test@localhost/test');
+  assert.notEqual(options.connectionString, process.env.DATABASE_URL);
 });
 
 test('migration ledger and unqualified application SQL stay within the configured pool schema', () => {

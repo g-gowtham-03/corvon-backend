@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 
 process.env.NODE_ENV='test';
-process.env.DATABASE_URL='postgres://test:test@localhost/test';
+process.env.RECOVERY_DATABASE_URL='postgres://recovery-test:recovery-test@localhost/test';
 process.env.OTP_PEPPER='o'.repeat(40);
 process.env.LOOKUP_PEPPER='l'.repeat(40);
 process.env.RECOVERY_SECRET_PEPPER='r'.repeat(40);

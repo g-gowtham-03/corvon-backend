@@ -5,7 +5,7 @@ const schema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().positive().default(3000),
   TRUST_PROXY_HOPS: z.coerce.number().int().nonnegative().default(0),
-  DATABASE_URL: z.string().min(1),
+  RECOVERY_DATABASE_URL: z.string().min(1),
   DB_SCHEMA: z.string()
     .regex(/^[a-z_][a-z0-9_]*$/, 'must be a lowercase PostgreSQL identifier')
     .refine(name => name !== 'public' && name !== 'pg_catalog' && name !== 'information_schema', 'must be a dedicated application schema')
@@ -42,7 +42,19 @@ export function parseConfig(env) {
   if (!parsed.success) {
     throw new Error(`Invalid environment configuration: ${parsed.error.issues.map(i => i.path.join('.') + ' ' + i.message).join('; ')}`);
   }
+  if (env.DATABASE_URL && sameDatabasePrincipal(env.DATABASE_URL, parsed.data.RECOVERY_DATABASE_URL)) {
+    throw new Error('Invalid environment configuration: RECOVERY_DATABASE_URL must use a separate restricted database role from DATABASE_URL');
+  }
   return parsed.data;
+}
+
+function sameDatabasePrincipal(legacyUrl, recoveryUrl) {
+  if (legacyUrl === recoveryUrl) return true;
+  try {
+    return new URL(legacyUrl).username === new URL(recoveryUrl).username;
+  } catch {
+    return false;
+  }
 }
 
 export const config = parseConfig(process.env);

@@ -4,6 +4,7 @@ import fs from 'node:fs';
 
 const api=fs.readFileSync(new URL('../src/app.js',import.meta.url),'utf8');
 const migration=fs.readFileSync(new URL('../src/db/migrations/001_initial.sql',import.meta.url),'utf8');
+const verificationMigration=fs.readFileSync(new URL('../src/db/migrations/003_mark_successful_otps.sql',import.meta.url),'utf8');
 
 test('permanent secret is constrained to one credential row per user',()=>{
   assert.match(migration,/recovery_credentials\s*\(\s*user_id uuid PRIMARY KEY/);
@@ -40,6 +41,9 @@ test('Forgot Secret implements verification and dashboard session, with no secre
   assert.match(api,/forgot-secret-challenges\/:id\/verifications/);
   assert.match(api,/forgot-secret-challenges\/:id\/complete/);
   assert.match(api,/createSession\(userId,'dashboard',config\.RECOVERY_SESSION_SECONDS\)/);
+  assert.match(api,/SET consumed_at=now\(\),verified_at=now\(\)/);
+  assert.match(api,/count\(DISTINCT contact_type\)::int AS verified FROM otp_challenges WHERE recovery_challenge_id=\$1 AND verified_at IS NOT NULL/);
+  assert.match(verificationMigration,/ADD COLUMN IF NOT EXISTS verified_at timestamptz/);
   assert.doesNotMatch(api,/forgot-secret[^\n]*UPDATE recovery_credentials/i);
 });
 test('location reports require active request, enrolled device, interval and encrypted storage',()=>{
@@ -78,5 +82,10 @@ test('recovery request FCM dispatch reports configuration state and omits privat
   assert.match(fcm,/not_configured/);
   assert.match(fcm,/sendEachForMulticast/);
   assert.match(fcm,/recoveryRequestId/);
+  assert.match(fcm,/expiresAt/);
+  assert.match(fcm,/sendRecoveryRequestStopped/);
+  assert.match(fcm,/recovery_request_stopped/);
   assert.doesNotMatch(fcm,/latitude|longitude|secret|otp/i);
+  assert.match(api,/sendRecoveryRequest\(tokenValues,r\.rows\[0\]\.id,r\.rows\[0\]\.expires_at\)/);
+  assert.match(api,/sendRecoveryRequestStopped\(devices\.rows\.map/);
 });

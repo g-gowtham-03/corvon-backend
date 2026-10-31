@@ -5,7 +5,7 @@ import { config } from '../config.js';
 // single-schema search_path deliberately excludes public and all other app schemas.
 export function poolOptionsFor(databaseConfig) {
   return {
-    connectionString: databaseConfig.DATABASE_URL,
+    connectionString: databaseConfig.RECOVERY_DATABASE_URL,
     ssl: databaseConfig.DATABASE_SSL === 'true' ? { rejectUnauthorized: true } : undefined,
     max: 10,
     application_name: 'corvon-recovery-api',

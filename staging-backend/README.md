@@ -4,12 +4,12 @@ Node.js + Express 5 API with PostgreSQL migrations. This is backend Stage 2 only
 
 ## Setup
 
-1. Install Node.js 20+ and PostgreSQL 14+.
-2. Copy `.env.example` to `.env`, set `DATABASE_URL`, and set `DB_SCHEMA` to the dedicated, pre-created PostgreSQL schema for this API (defaults to `corvon_recovery`). The value must be a lowercase PostgreSQL identifier matching `[a-z_][a-z0-9_]*`. Do not use `public`. The connection pool sets `search_path` to this schema alone; it never includes `public` as a fallback. Provision this schema and a database role restricted to it before running migrations. Keep the legacy API on its existing role and search path. Also provide strong, separate random values for `OTP_PEPPER`, `LOOKUP_PEPPER`, `RECOVERY_SECRET_PEPPER`, and `SESSION_PEPPER` (at least 32 bytes each). Set `CONTACT_DATA_KEY` to a base64-encoded 32-byte key. Keep `.env` out of source control. A key can be generated locally with `node -e "console.log(require('node:crypto').randomBytes(32).toString('base64'))"`; generate a separate value for each key.
+1. Use Node.js 22 or newer and PostgreSQL 14+.
+2. In the integrated Render service, keep `DATABASE_URL` for the legacy API. Set `RECOVERY_DATABASE_URL` to a separate PostgreSQL role for the Recovery API, with access only to the pre-created dedicated schema named by `DB_SCHEMA` (default `corvon_recovery`). The schema name must be a lowercase PostgreSQL identifier matching `[a-z_][a-z0-9_]*`; do not use `public`. The Recovery pool sets `search_path` to this schema alone and never falls back to `public`. Do not point `RECOVERY_DATABASE_URL` at the legacy role. Provide separate random values of at least 32 bytes for `OTP_PEPPER`, `LOOKUP_PEPPER`, `RECOVERY_SECRET_PEPPER`, and `SESSION_PEPPER`. Set `CONTACT_DATA_KEY` to a base64-encoded 32-byte key. Keep all values in the deployment secret store, never in Git.
 3. Configure Twilio SMS (`TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER`) and Resend email (`RESEND_API_KEY`, `EMAIL_FROM`) before requesting contact verification. If absent, the OTP request returns a delivery-unavailable error and no test OTP is exposed.
-4. Run `npm install` once dependencies are approved/available; create the PostgreSQL database; then run `npm run migrate`, `npm start`, and `npm test`.
+4. The Render start command remains `node server.js` from the repository root. The root server starts legacy routes even if Recovery secrets are not configured; in that state `/v1` returns `RECOVERY_API_UNAVAILABLE` and does not fall back to `DATABASE_URL`. Before enabling Recovery traffic, provision the dedicated schema/role in the existing PostgreSQL database and run `npm run migrate:recovery` with `RECOVERY_DATABASE_URL` configured. Do not run migrations using the legacy `DATABASE_URL`.
 
-The migration runner requires the target database and configured schema to exist, verifies that the schema is active, and takes a PostgreSQL advisory lock while applying migrations. Its `schema_migrations` ledger is created in the configured schema. All application, rate-limit, background-job, and migration table names are unqualified and resolve through the pool's single-schema search path; a missing recovery table therefore fails rather than falling through to a legacy table in `public`. PostgreSQL's system catalog remains available implicitly. Do not grant the recovery runtime role access to the legacy schema. For local development create a PostgreSQL database named in `DATABASE_URL` and pre-create the schema named by `DB_SCHEMA`. Production requires TLS termination, `DATABASE_SSL=true` as appropriate, managed secret storage, backups, and provider-approved sender identities. `TRUST_PROXY_HOPS` must match the actual trusted reverse-proxy hop count; leave it at 0 when clients connect directly.
+The migration runner requires the target database and configured schema to exist, verifies that the schema is active, and takes a PostgreSQL advisory lock while applying migrations. Its `schema_migrations` ledger is created in the configured schema. All Recovery application, rate-limit, background-job, and migration table names are unqualified and resolve through the Recovery pool's single-schema search path; a missing Recovery table therefore fails rather than falling through to a legacy table in `public`. PostgreSQL's system catalog remains available implicitly. Grant the Recovery role access only to its dedicated schema and required database connection. For local development set `RECOVERY_DATABASE_URL` and pre-create the schema named by `DB_SCHEMA`. The legacy root process continues to use `DATABASE_URL`. Production requires TLS termination, `DATABASE_SSL=true` as appropriate, managed secret storage, backups, and provider-approved sender identities. `TRUST_PROXY_HOPS` must match the actual trusted reverse-proxy hop count; leave it at 0 when clients connect directly.
 
 ## Workflow/API
 
@@ -31,15 +31,15 @@ All OTP challenges live for 5 minutes, allow at most 5 verification attempts, an
 
 ## Test coverage
 
-`npm test` runs security primitive and workflow-contract tests. PostgreSQL API integration tests are skipped unless `CORVON_TEST_DATABASE_URL` points to a dedicated database that has had `npm run migrate` applied. The integration suite uses an in-process mock HTTP provider for SMS/email; it does not configure or claim real provider delivery. Example PowerShell sequence after configuring `.env` to the dedicated test database:
+`npm test` from the repository root runs legacy contract tests and Recovery security/workflow tests. PostgreSQL API integration tests are skipped unless `CORVON_TEST_DATABASE_URL` points to a dedicated test database/schema that has had migrations applied. The integration suite uses an in-process mock HTTP provider for SMS/email; it does not configure or claim real provider delivery. Example PowerShell sequence after configuring the test environment:
 
 ```powershell
-npm run migrate
-$env:CORVON_TEST_DATABASE_URL = $env:DATABASE_URL
+$env:RECOVERY_DATABASE_URL = $env:CORVON_TEST_DATABASE_URL
+npm run migrate:recovery
 npm test
 ```
 
-The database integration suite covers OTP expiry and concurrent attempt limits, Forgot Secret completion, login lockout, recovery status authorization, provider failure/retry, and cross-instance PostgreSQL rate counters. Without the test database, those cases are reported as skipped/NOT TESTED.
+The ordered migration set creates the dedicated Recovery tables and adds a `verified_at` marker so consumed expired or attempt-exhausted Forgot Secret OTPs cannot count as successful verification. The database integration suite covers OTP expiry and concurrent attempt limits, Forgot Secret completion, login lockout, recovery status authorization, provider failure/retry, and cross-instance PostgreSQL rate counters. Without the test database, those cases are reported as skipped/NOT TESTED.
 
 ## Security notes
 
